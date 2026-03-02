@@ -49,6 +49,8 @@ export default function Home() {
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [showFileModal, setShowFileModal] = useState(false);
   const [currentFile, setCurrentFile] = useState<{ path: string; content: string }>({ path: '', content: '' });
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingSessionName, setEditingSessionName] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -59,7 +61,10 @@ export default function Home() {
         const response = await fetch('/api/sessions');
         if (response.ok) {
           const data = await response.json();
-          const sessionList = data.sessions.map((id: string) => ({ id, name: id }));
+          const sessionList = data.sessions.map((session: { session_id: string; session_name: string }) => ({
+            id: session.session_id,
+            name: session.session_name
+          }));
           setSessions(sessionList);
           if (sessionList.length > 0) {
             setActiveSession(sessionList[0].id);
@@ -155,7 +160,7 @@ export default function Home() {
 
   // 滚动到最新消息
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [messages]);
 
   // 发送消息
@@ -376,11 +381,33 @@ export default function Home() {
     }
   };
 
-  const createNewSession = () => {
+  const createNewSession = async () => {
     const newSessionId = `session_${Date.now()}`;
-    setSessions(prev => [...prev, { id: newSessionId, name: newSessionId }]);
-    setActiveSession(newSessionId);
-    setMessages([]);
+    const newSessionName = newSessionId;
+    
+    try {
+      // 向后端发送请求，创建会话并添加到映射
+      const response = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: newSessionId,
+          session_name: newSessionName
+        })
+      });
+      
+      if (response.ok) {
+        // 更新会话列表
+        setSessions(prev => [...prev, { id: newSessionId, name: newSessionName }]);
+        setActiveSession(newSessionId);
+        setMessages([]);
+      } else {
+        alert('创建会话失败');
+      }
+    } catch (error) {
+      console.error('创建会话失败:', error);
+      alert('创建会话时发生错误');
+    }
   };
 
   const deleteSession = async (sessionId: string) => {
@@ -393,6 +420,7 @@ export default function Home() {
 
         if (response.ok) {
           setSessions(prev => prev.filter(session => session.id !== sessionId));
+          
           if (activeSession === sessionId) {
             const remainingSessions = sessions.filter(s => s.id !== sessionId);
             if (remainingSessions.length > 0) {
@@ -413,6 +441,64 @@ export default function Home() {
       }
     }
   };
+
+  const startEditSession = (sessionId: string, currentName: string) => {
+    setEditingSessionId(sessionId);
+    setEditingSessionName(currentName);
+  };
+
+  const saveSessionName = async () => {
+    if (!editingSessionId || !editingSessionName.trim()) return;
+    
+    try {
+      const response = await fetch(`/api/sessions/${editingSessionId}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editingSessionName.trim() })
+      });
+      
+      if (response.ok) {
+        // 更新会话列表
+        setSessions(prev => prev.map(session => 
+          session.id === editingSessionId 
+            ? { ...session, name: editingSessionName.trim() } 
+            : session
+        ));
+        
+        setEditingSessionId(null);
+        setEditingSessionName('');
+      } else {
+        alert('重命名会话失败');
+      }
+    } catch (error) {
+      console.error('重命名会话失败:', error);
+      alert('重命名会话时发生错误');
+    }
+  };
+
+  const cancelEditSession = () => {
+    setEditingSessionId(null);
+    setEditingSessionName('');
+  };
+
+  // 点击外部区域退出编辑状态
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (editingSessionId) {
+        const target = event.target as HTMLElement;
+        // 检查点击的元素是否在编辑区域内
+        const editingElement = document.querySelector(`[data-session-id="${editingSessionId}"]`);
+        if (editingElement && !editingElement.contains(target)) {
+          cancelEditSession();
+        }
+      }
+    };
+
+    document.addEventListener('click', handleClickOutside);
+    return () => {
+      document.removeEventListener('click', handleClickOutside);
+    };
+  }, [editingSessionId]);
 
   return (
     <div className="app-shell flex h-screen overflow-hidden bg-gray-50">
@@ -449,21 +535,75 @@ export default function Home() {
               {sessions.map(session => (
                 <div
                   key={session.id}
+                  data-session-id={session.id}
                   className={`flex items-center justify-between p-2 rounded-md cursor-pointer ${
                     activeSession === session.id ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
                   }`}
                   onClick={() => setActiveSession(session.id)}
                 >
-                  <span className="text-sm font-medium truncate">{session.name}</span>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      deleteSession(session.id);
-                    }}
-                    className="p-1 rounded-md hover:bg-gray-200 transition-colors"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  {editingSessionId === session.id ? (
+                    <div className="flex-1 flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={editingSessionName}
+                        onChange={(e) => setEditingSessionName(e.target.value)}
+                        onKeyPress={(e) => {
+                          if (e.key === 'Enter') {
+                            e.stopPropagation();
+                            saveSessionName();
+                          }
+                        }}
+                        className="w-40 px-2 py-1 text-xs border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        autoFocus
+                      />
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          saveSessionName();
+                        }}
+                        className="p-1 text-green-600 hover:bg-green-100 rounded-md"
+                        title="保存"
+                      >
+                        ✓
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          cancelEditSession();
+                        }}
+                        className="p-1 text-gray-600 hover:bg-gray-100 rounded-md"
+                        title="取消"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <span className="text-sm font-medium truncate">{session.name}</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startEditSession(session.id, session.name);
+                          }}
+                          className="p-1 rounded-md hover:bg-gray-200 transition-colors"
+                          title="重命名"
+                        >
+                          ✏️
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteSession(session.id);
+                          }}
+                          className="p-1 rounded-md hover:bg-gray-200 transition-colors"
+                          title="删除"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               ))}
             </div>
@@ -536,21 +676,20 @@ export default function Home() {
               {messages.map(message => (
                 <div
                   key={message.id}
-                  className={`p-4 rounded-lg ${
-                    message.role === 'user' ? 'bg-blue-600 text-white ml-auto max-w-3xl' :
-                    message.role === 'assistant' ? 'bg-white border border-gray-200 max-w-3xl' :
-                    message.role === 'thought' ? 'bg-purple-50 border border-purple-200 max-w-3xl' :
-                    message.role === 'tool' ? 'bg-green-50 border border-green-200 max-w-3xl' :
-                    message.role === 'error' ? 'bg-red-50 border border-red-200 text-red-600 max-w-3xl' :
-                    'bg-gray-50 border border-gray-200 max-w-3xl'
-                  }`}
+                  className={`p-4 rounded-lg ${message.role === 'user' ? 'bg-blue-600 text-white ml-auto max-w-3xl' :
+                      message.role === 'assistant' ? 'bg-white border border-gray-200 max-w-3xl' :
+                        message.role === 'thought' ? 'bg-purple-50 border border-purple-200 max-w-3xl' :
+                          message.role === 'tool' ? 'bg-green-50 border border-green-200 max-w-3xl' :
+                            message.role === 'error' ? 'bg-red-50 border border-red-200 text-red-600 max-w-3xl' :
+                              'bg-gray-50 border border-gray-200 max-w-3xl'
+                    }`}
                 >
                   <div className="font-medium mb-2 text-sm">
                     {message.role === 'user' ? 'You' :
-                     message.role === 'assistant' ? 'Assistant' :
-                     message.role === 'thought' ? 'Thinking' :
-                     message.role === 'tool' ? 'Tool' :
-                     message.role === 'error' ? 'Error' : ''}
+                      message.role === 'assistant' ? 'Assistant' :
+                        message.role === 'thought' ? 'Thinking' :
+                          message.role === 'tool' ? 'Tool' :
+                            message.role === 'error' ? 'Error' : ''}
                   </div>
 
                   {message.role === 'assistant' && (
@@ -622,18 +761,16 @@ export default function Home() {
             <div className="flex items-center gap-4">
               <button
                 onClick={() => setActiveTab('memory')}
-                className={`flex items-center gap-2 px-2 py-1 rounded-md ${
-                  activeTab === 'memory' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
-                }`}
+                className={`flex items-center gap-2 px-2 py-1 rounded-md ${activeTab === 'memory' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
+                  }`}
               >
                 <Book className="w-5 h-5" />
                 Memory
               </button>
               <button
                 onClick={() => setActiveTab('skills')}
-                className={`flex items-center gap-2 px-2 py-1 rounded-md ${
-                  activeTab === 'skills' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
-                }`}
+                className={`flex items-center gap-2 px-2 py-1 rounded-md ${activeTab === 'skills' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
+                  }`}
               >
                 <Code className="w-5 h-5" />
                 Skills

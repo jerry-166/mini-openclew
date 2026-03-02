@@ -63,3 +63,17 @@
 ## 用户关系
 
 - 好朋友: 秋阳
+\n
+## 技能格式规范 (Skill Format Standard)
+
+- **唯一标准**: 所有技能的 `SKILL.md` 文件都必须严格遵守 **"YAML Front Matter + Markdown"** 的结构。
+- **结构**:
+    - **YAML Front Matter**: 文件开头使用 `---` 包裹，用于定义 `name` 和 `description`。
+    - **Markdown Body**: 文件的其余部分使用标准 Markdown 语法，详细说明技能的功能、步骤、示例代码和注意事项。
+- **来源**: 此规范根据 Jerry 的指示，以 `get_weather` 技能为模板确立。
+
+## 记忆协议 (Memory Protocol)
+
+- **触发指令**: 当 Jerry 说“记住”或类似指令时，必须将指定信息记录下来。
+- **存储位置**: 所有需要长期记住的信息都必须写入到 `memory/MEMORY.md` 文件中。
+- **执行方式**: 通过 `read_file` 读取现有内容，然后使用文件操作（如 Python 的 `open(..., 'a')`）将新信息追加到文件末尾。

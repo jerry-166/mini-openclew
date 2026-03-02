@@ -28,7 +28,8 @@
 ```
 mini-openclaw/
 ├── backend/ # FastAPI + LangChain/LangGraph
-│   ├── app.py # 入口文件 (Port 8002)
+│   ├── app.py # 入口文件 (Port 8002)(invoke式，AI/USER消息)
+│   ├── app_t.py # 入口文件2 (Port 8002)(流式，AI/USER/TOOL消息)
 │   ├── memory/ # 记忆存储
 │   │   ├── logs/ # Daily logs
 │   │   └── MEMORY.md # Core memory

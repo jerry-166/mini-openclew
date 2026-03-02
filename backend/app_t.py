@@ -1,8 +1,9 @@
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal, Optional
 
 import dotenv
 from fastapi import FastAPI, HTTPException, Body
@@ -60,12 +61,77 @@ app.add_middleware(
 
 
 # 会话管理
-def get_session_file(session_id: str) -> str:
+def get_session_file_by_id(session_id: str) -> str:
+    """根据 session ID 获取会话文件路径"""
     return os.path.join("sessions", f"{session_id}.json")
+
+def get_session_name_by_id(session_id: str) -> str:
+    """根据 session ID 获取 session name"""
+    path = os.path.join("sessions", "name_id_map.json")
+    # 确保文件存在
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    with open(path, "r", encoding="utf-8") as f:
+        data_list = json.load(f)
+    for item in data_list:
+        if item["session_id"] == session_id:
+            return item["session_name"]
+    return session_id  # 如果未找到，返回 ID 本身
+
+def get_session_id_by_name(session_name: str) -> str:
+    """根据 session name 获取 session ID"""
+    path = os.path.join("sessions", "name_id_map.json")
+    # 确保文件存在
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    with open(path, "r", encoding="utf-8") as f:
+        data_list = json.load(f)
+    for item in data_list:
+        if item["session_name"] == session_name:
+            return item["session_id"]
+    return session_name  # 如果未找到，返回 name 本身
+
+def get_session_file_by_name(session_name: str) -> str:
+    """根据 session name 获取会话文件路径"""
+    session_id = get_session_id_by_name(session_name)
+    return get_session_file_by_id(session_id)
+
+
+def update_session_map(
+        type: Literal["add", "delete", "rename"],
+        session_name: str,
+        session_id: Optional[str] = None
+) -> bool:
+    path = os.path.join("sessions", "name_id_map.json")
+    # 创建目录
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 确保文件存在
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    # 读取文件
+    with open(path, "r", encoding="utf-8") as f:
+        data_list = json.load(f)
+    # 处理不同类型的操作
+    if type == "add" and session_id:
+        data_list.append({"session_name": session_name, "session_id": session_id})
+    elif type == "delete":
+        data_list = [item for item in data_list if item["session_name"] != session_name]
+    elif type == "rename" and session_id:
+        for item in data_list:
+            if item["session_id"] == session_id:
+                item["session_name"] = session_name
+    # 保存文件
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data_list, f, ensure_ascii=False, indent=2)
+    return True
 
 
 # 新增辅助函数：将 LangChain 消息列表转换为可存储的字典列表
-
 def serialize_for_json(value: Any) -> Any:
     """Recursively convert LangChain messages and containers into JSON-serializable data."""
     if isinstance(value, BaseMessage):
@@ -84,7 +150,7 @@ def messages_to_serializable(messages: List[BaseMessage]) -> List[Dict[str, Any]
 
 # 修改 load_session：兼容新旧格式，并转换为 BaseMessage 列表
 def load_session(session_id: str) -> List[BaseMessage]:
-    session_file = get_session_file(session_id)
+    session_file = get_session_file_by_id(session_id)
     if os.path.exists(session_file):
         with open(session_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -106,7 +172,7 @@ def load_session(session_id: str) -> List[BaseMessage]:
 
 # 修改 save_session：接收 BaseMessage 列表，序列化后保存
 def save_session(session_id: str, messages: List[BaseMessage]):
-    session_file = get_session_file(session_id)
+    session_file = get_session_file_by_id(session_id)
     os.makedirs(os.path.dirname(session_file), exist_ok=True)
     serializable = messages_to_serializable(messages)
     with open(session_file, "w", encoding="utf-8") as f:
@@ -301,20 +367,20 @@ async def save_file(path: str = Body(..., embed=True), content: str = Body(..., 
 
 
 @app.get("/api/sessions")
-async def get_sessions():
-    """获取所有历史会话列表"""
+async def get_sessions_map():
+    """获取name_id_list"""
     try:
         sessions_dir = "sessions"
-        if not os.path.exists(sessions_dir):
+        os.makedirs(sessions_dir, exist_ok=True)
+        path = os.path.join(sessions_dir, f"name_id_map.json")
+
+        if not os.path.exists(path):
             return {"sessions": []}
 
-        sessions = []
-        for filename in os.listdir(sessions_dir):
-            if filename.endswith(".json"):
-                session_id = filename[:-5]  # 去掉.json后缀
-                sessions.append(session_id)
+        with open(path, "r", encoding="utf-8") as f:
+            name_id_map_list = json.load(f)
 
-        return {"sessions": sessions}
+        return {"sessions": name_id_map_list}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -323,12 +389,45 @@ async def get_sessions():
 async def delete_session(session_id: str):
     """删除指定会话"""
     try:
-        session_file = get_session_file(session_id)
+        # 删除对应的文件和映射
+        session_file = get_session_file_by_id(session_id)
         if os.path.exists(session_file):
             os.remove(session_file)
+            # 删除映射(读取，删除，保存)
+            session_name = get_session_name_by_id(session_id)
+            update_session_map("delete", session_name)
             return {"status": "success"}
         else:
             raise HTTPException(status_code=404, detail="Session not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sessions/{session_id}/rename")
+async def rename_session(session_id: str, name: str = Body(..., embed=True)):
+    """重命名指定会话"""
+    try:
+        # 通过更改映射文件中的映射修改会话名称(读取，修改，保存)
+        update_session_map("rename", name, session_id)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sessions")
+async def create_session(session_id: str = Body(..., embed=True), session_name: str = Body(..., embed=True)):
+    """创建新会话"""
+    try:
+        # 创建会话文件
+        session_file = get_session_file_by_id(session_id)
+        os.makedirs(os.path.dirname(session_file), exist_ok=True)
+        with open(session_file, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+        
+        # 添加到映射
+        update_session_map("add", session_name, session_id)
+        
+        return {"status": "success", "session_id": session_id, "session_name": session_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
