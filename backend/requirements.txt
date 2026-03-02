@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+langchain
+langchain_community
+langchain_experimental
+llama-index
+beautifulsoup4
+html2text
+python-dotenv
+langchain_openai
