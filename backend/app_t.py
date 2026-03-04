@@ -1,11 +1,12 @@
 import asyncio
 import json
 import os
-import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Literal, Optional
 
 import dotenv
+import redis
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,41 +14,114 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, ToolMessage, AIMessageChunk, HumanMessage, messages_from_dict, \
     message_to_dict, BaseMessage
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres import AsyncPostgresStore
+from psycopg_pool import AsyncConnectionPool
 
+from backend.api.login import login_router
+from backend.utils.config import Config
+from backend.utils.logger import get_logger
 from tools.core_tools import get_core_tools
 from tools.memory_manager import MemoryManager
 from tools.skills_manager import SkillsManager
 
-# 初始化核心组件
-skills_manager = SkillsManager()
-memory_manager = MemoryManager()
-core_tools = get_core_tools()
+# 使用统一的日志配置
+logger = get_logger(__name__)
+logger.debug("日志处理器加载完毕")
 
-# 生成技能快照
-skills_manager.generate_skills_snapshot()
 
-dotenv.load_dotenv()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        # 初始化核心组件
+        app.state.skills_manager = SkillsManager()
+        app.state.memory_manager = MemoryManager()
+        app.state.core_tools = get_core_tools()
+        logger.info("核心组件初始化完成")
 
-llm = ChatOpenAI(
-    model=os.getenv("MODEL"),
-    base_url=os.getenv("BASE_URL"),
-    api_key=os.getenv("API_KEY", "sk-placeholder"),
-    temperature=0.7
-)
+        # 模拟用户库
+        USER_DB = {"admin": "1234", "user1": "654321"}
+        app.state.user_db = USER_DB
+        # 生成技能快照
+        app.state.skills_manager.generate_skills_snapshot()
+        logger.debug("技能快照生成完成")
 
-# 构建Agent
-agent = create_agent(
-    tools=core_tools,
-    system_prompt=memory_manager.get_system_prompt(),
-    model=llm,
-    checkpointer=InMemorySaver()
-)
+        # 配置Redis连接
+        redis_client = redis.Redis(
+            host="localhost",
+            port=6379,
+            db=6,
+            password="1234",
+            decode_responses=True,
+        )
+        app.state.cache = redis_client
+
+        dotenv.load_dotenv()
+
+        app.state.llm = ChatOpenAI(
+            model=os.getenv("MODEL"),
+            base_url=os.getenv("BASE_URL"),
+            api_key=os.getenv("API_KEY", "sk-placeholder"),
+            temperature=0.7
+        )
+        logger.debug("LLM模型加载完成")
+
+        # 构建postgres异步连接
+        pool = AsyncConnectionPool(
+            conninfo=Config.DB_URL,
+            open=False,
+            min_size=Config.MIN_SIZE,
+            max_size=Config.MAX_SIZE,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+            timeout=Config.TIMEOUT,
+        )
+        app.state.pg_pool = pool
+        await pool.open()
+        logger.info("Postgres 连接池已创建并打开")
+
+        # 使用一个临时连接做探针检活
+        async with pool.connection(timeout=30.0) as conn:
+            await conn.execute("SELECT 1")
+            logger.debug("Postgres 连接池探针检活成功")
+
+        # 如果后续需要用 sync 风格访问，可另外创建封装，这里先不在 state 上挂单个连接
+        # app.state.pg = ...
+
+        # 创建异步postgres保存器和存储器
+        saver = AsyncPostgresSaver(conn=pool)
+        await saver.setup()  # 初始化数据库表结构
+        store = AsyncPostgresStore(conn=pool)
+        await store.setup()  # 初始化数据库表结构
+        logger.info("数据库检查点保存器和存储已创建并初始化")
+
+        # 构建Agent
+        app.state.agent = create_agent(
+            tools=app.state.core_tools,
+            system_prompt=app.state.memory_manager.get_system_prompt(),
+            model=app.state.llm,
+            checkpointer=saver,
+            store=store,
+            # context_schema="", 目前不使用
+        )
+        logger.info("智能体创建完成")
+
+        yield  # 将控制交给应用
+    except Exception as e:
+        logger.error(f"应用启动时发生错误: {str(e)}")
+        raise RuntimeError(f"服务初始化失败：{str(e)}")
+    finally:
+        if "pool" in locals() and pool is not None:
+            await pool.close()
+        if "redis_client" in locals() and redis_client is not None:
+            redis_client.close()
+        logger.info("关闭服务并完成资源清理")
+
 
 app = FastAPI(
     title="Mini-OpenClaw API",
     description="基于LangChain的AI Agent系统API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # 配置CORS
@@ -59,11 +133,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 添加路由
+app.include_router(login_router)
+
 
 # 会话管理
 def get_session_file_by_id(session_id: str) -> str:
     """根据 session ID 获取会话文件路径"""
     return os.path.join("sessions", f"{session_id}.json")
+
 
 def get_session_name_by_id(session_id: str) -> str:
     """根据 session ID 获取 session name"""
@@ -80,6 +158,7 @@ def get_session_name_by_id(session_id: str) -> str:
             return item["session_name"]
     return session_id  # 如果未找到，返回 ID 本身
 
+
 def get_session_id_by_name(session_name: str) -> str:
     """根据 session name 获取 session ID"""
     path = os.path.join("sessions", "name_id_map.json")
@@ -94,6 +173,7 @@ def get_session_id_by_name(session_name: str) -> str:
         if item["session_name"] == session_name:
             return item["session_id"]
     return session_name  # 如果未找到，返回 name 本身
+
 
 def get_session_file_by_name(session_name: str) -> str:
     """根据 session name 获取会话文件路径"""
@@ -183,6 +263,7 @@ def save_session(session_id: str, messages: List[BaseMessage]):
 @app.post("/api/chat")
 async def chat(
         message: str = Body(..., embed=True),
+        user_id: str = Body(..., embed=True),
         session_id: str = Body(..., embed=True),
         stream: bool = Body(True, embed=True)
 ):
@@ -193,7 +274,7 @@ async def chat(
     messages.append(HumanMessage(content=message))
 
     # 配置 LangGraph 的线程 ID，用于后续获取状态
-    config = {"configurable": {"thread_id": session_id}}
+    config = {"configurable": {"thread_id": session_id, "user_id": user_id}}
 
     # 使用 Agent 处理用户请求
     async def generate_response():
@@ -206,7 +287,7 @@ async def chat(
             # 存储最终消息列表的占位符（将在流结束后通过 get_state 获取）
             final_messages = None
             # 可选：收集工具调用/结果用于即时推送（与之前相同）
-            async for stream_mode, data in agent.astream(
+            async for stream_mode, data in app.state.agent.astream(
                     {"messages": messages},
                     stream_mode=["updates", "messages"],
                     config=config  # 传入 config
@@ -229,7 +310,7 @@ async def chat(
                             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             # 流结束后，通过 agent.aget_state 获取最终状态中的消息列表
-            state = await agent.aget_state(config)
+            state = await app.state.agent.aget_state(config)
             final_messages = state.values.get("messages", [])
 
             # 保存完整消息历史
@@ -249,7 +330,7 @@ async def chat(
     else:
         # 非流式响应
         try:
-            result = agent.invoke({"messages": messages}, config=config)
+            result = app.state.agent.invoke({"messages": messages}, config=config)
             # result 通常是包含最终状态 dict，其中 "messages" 键为消息列表
             final_messages = result.get("messages", [])
             save_session(session_id, final_messages)
@@ -267,7 +348,10 @@ async def chat(
 @app.get("/api/history/{session_id}")
 async def get_history(session_id: str):
     try:
-        messages = load_session(session_id)  # 返回 BaseMessage 列表
+        # todo: ...
+        # messages = load_session(session_id)  # 返回 BaseMessage 列表
+        messages = app.state.agent.aget_state({"configurable": {"thread_id": session_id, "user_id": app.state.user_id}}).values.get("messages", [])
+        logger.critical(f"获取历史消息，session_id: {session_id}, 消息数量: {len(messages)}")
         # 转换为前端可用的格式（保留原始结构，或简化）
         simplified = []
         for msg in messages:
@@ -295,7 +379,7 @@ async def get_history(session_id: str):
 async def list_skills():
     """列出所有可用技能"""
     try:
-        skills = skills_manager.scan_skills()
+        skills = app.state.skills_manager.scan_skills()
         return {"skills": skills}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -423,10 +507,10 @@ async def create_session(session_id: str = Body(..., embed=True), session_name: 
         os.makedirs(os.path.dirname(session_file), exist_ok=True)
         with open(session_file, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=2)
-        
+
         # 添加到映射
         update_session_map("add", session_name, session_id)
-        
+
         return {"status": "success", "session_id": session_id, "session_name": session_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -434,5 +518,15 @@ async def create_session(session_id: str = Body(..., embed=True), session_name: 
 
 if __name__ == "__main__":
     import uvicorn
+    from asyncio.windows_events import WindowsSelectorEventLoopPolicy
 
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    # 确保 uvicorn 使用兼容的事件循环
+    asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+
+    # 在当前策略下显式创建事件循环，避免ProactorEventLoop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=8002, loop="asyncio")
+    server = uvicorn.Server(config)
+    loop.run_until_complete(server.serve())
