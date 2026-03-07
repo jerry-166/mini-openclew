@@ -3,24 +3,25 @@ import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Dict, Any, Literal, Optional
+from typing import List, Dict, Any
 
 import dotenv
 import redis
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, ToolMessage, AIMessageChunk, HumanMessage, messages_from_dict, \
-    message_to_dict, BaseMessage
+from langchain_core.messages import AIMessage, ToolMessage, AIMessageChunk, HumanMessage, message_to_dict, BaseMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres import AsyncPostgresStore
 from psycopg_pool import AsyncConnectionPool
 
 from backend.api.login import login_router
+from backend.api.user import user_router
 from backend.utils.config import Config
 from backend.utils.logger import get_logger
+from backend.utils.middleware import create_middleware
 from tools.core_tools import get_core_tools
 from tools.memory_manager import MemoryManager
 from tools.skills_manager import SkillsManager
@@ -39,9 +40,6 @@ async def lifespan(app: FastAPI):
         app.state.core_tools = get_core_tools()
         logger.info("核心组件初始化完成")
 
-        # 模拟用户库
-        USER_DB = {"admin": "1234", "user1": "654321"}
-        app.state.user_db = USER_DB
         # 生成技能快照
         app.state.skills_manager.generate_skills_snapshot()
         logger.debug("技能快照生成完成")
@@ -51,7 +49,7 @@ async def lifespan(app: FastAPI):
             host="localhost",
             port=6379,
             db=6,
-            password="1234",
+            # password="1234",  # 如果 Redis 没有配置密码，注释掉此行
             decode_responses=True,
         )
         app.state.cache = redis_client
@@ -84,15 +82,16 @@ async def lifespan(app: FastAPI):
             await conn.execute("SELECT 1")
             logger.debug("Postgres 连接池探针检活成功")
 
-        # 如果后续需要用 sync 风格访问，可另外创建封装，这里先不在 state 上挂单个连接
-        # app.state.pg = ...
-
         # 创建异步postgres保存器和存储器
         saver = AsyncPostgresSaver(conn=pool)
         await saver.setup()  # 初始化数据库表结构
         store = AsyncPostgresStore(conn=pool)
         await store.setup()  # 初始化数据库表结构
         logger.info("数据库检查点保存器和存储已创建并初始化")
+        
+        # 初始化数据库表结构
+        from backend.utils.db_init import init_db
+        await init_db(pool)
 
         # 构建Agent
         app.state.agent = create_agent(
@@ -133,82 +132,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 创建并添加认证中间件
+create_middleware(app)
+
 # 添加路由
 app.include_router(login_router)
+app.include_router(user_router)
 
 
 # 会话管理
 def get_session_file_by_id(session_id: str) -> str:
     """根据 session ID 获取会话文件路径"""
     return os.path.join("sessions", f"{session_id}.json")
-
-
-def get_session_name_by_id(session_id: str) -> str:
-    """根据 session ID 获取 session name"""
-    path = os.path.join("sessions", "name_id_map.json")
-    # 确保文件存在
-    if not os.path.exists(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump([], f)
-    with open(path, "r", encoding="utf-8") as f:
-        data_list = json.load(f)
-    for item in data_list:
-        if item["session_id"] == session_id:
-            return item["session_name"]
-    return session_id  # 如果未找到，返回 ID 本身
-
-
-def get_session_id_by_name(session_name: str) -> str:
-    """根据 session name 获取 session ID"""
-    path = os.path.join("sessions", "name_id_map.json")
-    # 确保文件存在
-    if not os.path.exists(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump([], f)
-    with open(path, "r", encoding="utf-8") as f:
-        data_list = json.load(f)
-    for item in data_list:
-        if item["session_name"] == session_name:
-            return item["session_id"]
-    return session_name  # 如果未找到，返回 name 本身
-
-
-def get_session_file_by_name(session_name: str) -> str:
-    """根据 session name 获取会话文件路径"""
-    session_id = get_session_id_by_name(session_name)
-    return get_session_file_by_id(session_id)
-
-
-def update_session_map(
-        type: Literal["add", "delete", "rename"],
-        session_name: str,
-        session_id: Optional[str] = None
-) -> bool:
-    path = os.path.join("sessions", "name_id_map.json")
-    # 创建目录
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # 确保文件存在
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump([], f)
-    # 读取文件
-    with open(path, "r", encoding="utf-8") as f:
-        data_list = json.load(f)
-    # 处理不同类型的操作
-    if type == "add" and session_id:
-        data_list.append({"session_name": session_name, "session_id": session_id})
-    elif type == "delete":
-        data_list = [item for item in data_list if item["session_name"] != session_name]
-    elif type == "rename" and session_id:
-        for item in data_list:
-            if item["session_id"] == session_id:
-                item["session_name"] = session_name
-    # 保存文件
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data_list, f, ensure_ascii=False, indent=2)
-    return True
 
 
 # 新增辅助函数：将 LangChain 消息列表转换为可存储的字典列表
@@ -228,26 +163,16 @@ def messages_to_serializable(messages: List[BaseMessage]) -> List[Dict[str, Any]
     return [message_to_dict(msg) for msg in messages]
 
 
-# 修改 load_session：兼容新旧格式，并转换为 BaseMessage 列表
-def load_session(session_id: str) -> List[BaseMessage]:
-    session_file = get_session_file_by_id(session_id)
-    if os.path.exists(session_file):
-        with open(session_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # 如果是旧格式（仅有 role/content），转换为标准消息字典
-        if data and "role" in data[0] and "content" in data[0] and "type" not in data[0]:
-            # 旧格式转换：user->HumanMessage, assistant->AIMessage
-            new_data = []
-            for msg in data:
-                if msg["role"] == "user":
-                    new_data.append({"type": "human", "data": {"content": msg["content"]}})
-                elif msg["role"] == "assistant":
-                    new_data.append({"type": "ai", "data": {"content": msg["content"]}})
-                # 旧格式没有 tool messages, 忽略
-            data = new_data
-        # 使用 LangChain 内置反序列化
-        return messages_from_dict(data)
-    return []
+async def load_session(session_id: str) -> List[BaseMessage]:
+    try:
+        # 从 LangGraph 检查点获取会话状态
+        config = {"configurable": {"thread_id": session_id}}
+        state = await app.state.agent.aget_state(config)
+        messages = state.values.get("messages", [])
+        return messages
+    except Exception as e:
+        logger.error(f"加载会话失败: {str(e)}")
+        return []
 
 
 # 修改 save_session：接收 BaseMessage 列表，序列化后保存
@@ -263,12 +188,12 @@ def save_session(session_id: str, messages: List[BaseMessage]):
 @app.post("/api/chat")
 async def chat(
         message: str = Body(..., embed=True),
-        user_id: str = Body(..., embed=True),
+        user_id: int = Body(..., embed=True),
         session_id: str = Body(..., embed=True),
         stream: bool = Body(True, embed=True)
 ):
     # 加载会话历史（现为 BaseMessage 列表）
-    messages = load_session(session_id)
+    messages = await load_session(session_id)
 
     # 添加用户消息
     messages.append(HumanMessage(content=message))
@@ -315,7 +240,7 @@ async def chat(
 
             # 保存完整消息历史
             save_session(session_id, final_messages)
-
+            logger.info("chat接口---会话保存成功，session_id: %s, 消息数量: %s", session_id, len(final_messages))
         except Exception as e:
             # 错误处理
             error_message = f"处理请求时发生错误: {str(e)}"
@@ -324,6 +249,7 @@ async def chat(
             # 保存错误信息（作为 AI 消息）
             error_msg = AIMessage(content=error_message)
             save_session(session_id, messages + [error_msg])
+            logger.error("chat接口---发生错误，session_id: %s, 错误信息: %s", session_id, error_message)
 
     if stream:
         return StreamingResponse(generate_response(), media_type="text/event-stream")
@@ -336,11 +262,14 @@ async def chat(
             save_session(session_id, final_messages)
             # 返回最后一条 AI 消息的内容
             last_ai_message = next((msg for msg in reversed(final_messages) if isinstance(msg, AIMessage)), None)
+            logger.info("chat接口---非流式响应，session_id: %s, 消息数量: %s", session_id, len(final_messages))
             return {"response": last_ai_message.content if last_ai_message else ""}
         except Exception as e:
             error_message = f"处理请求时发生错误: {str(e)}"
             error_msg = AIMessage(content=error_message)
             save_session(session_id, messages + [error_msg])
+            logger.error("chat接口---非流式响应发生错误，session_id: %s, 错误信息: %s", session_id, error_message)
+
             raise HTTPException(status_code=500, detail=error_message)
 
 
@@ -348,9 +277,9 @@ async def chat(
 @app.get("/api/history/{session_id}")
 async def get_history(session_id: str):
     try:
-        # todo: ...
-        # messages = load_session(session_id)  # 返回 BaseMessage 列表
-        messages = app.state.agent.aget_state({"configurable": {"thread_id": session_id, "user_id": app.state.user_id}}).values.get("messages", [])
+        config = {"configurable": {"thread_id": session_id}}
+        state = await app.state.agent.aget_state(config)
+        messages = state.values.get("messages", [])
         logger.critical(f"获取历史消息，session_id: {session_id}, 消息数量: {len(messages)}")
         # 转换为前端可用的格式（保留原始结构，或简化）
         simplified = []
@@ -375,6 +304,7 @@ async def get_history(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# todo：需要根据不同用户去区分skills
 @app.get("/api/skills/list")
 async def list_skills():
     """列出所有可用技能"""
@@ -450,39 +380,33 @@ async def save_file(path: str = Body(..., embed=True), content: str = Body(..., 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/sessions")
-async def get_sessions_map():
-    """获取name_id_list"""
-    try:
-        sessions_dir = "sessions"
-        os.makedirs(sessions_dir, exist_ok=True)
-        path = os.path.join(sessions_dir, f"name_id_map.json")
-
-        if not os.path.exists(path):
-            return {"sessions": []}
-
-        with open(path, "r", encoding="utf-8") as f:
-            name_id_map_list = json.load(f)
-
-        return {"sessions": name_id_map_list}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
     """删除指定会话"""
     try:
-        # 删除对应的文件和映射
+        # 删除数据库信息
+        async with app.state.pg_pool.connection(timeout=30.0) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT thread_id FROM sessions WHERE thread_id = %s",
+                    (session_id,)
+                )
+                result = await cur.fetchone()
+                if not result or not result[0]:
+                    logger.error("会话ID %s 不存在，无法删除", session_id)
+                    raise HTTPException(status_code=404, detail="Session not found in database")
+
+                await cur.execute(
+                    "DELETE FROM sessions WHERE thread_id = %s",
+                    (session_id,)
+                )
+                logger.debug("会话删除成功，session_id: %s", session_id)
+        # 删除sessions目录下的会话文件（如果存在）
         session_file = get_session_file_by_id(session_id)
         if os.path.exists(session_file):
             os.remove(session_file)
-            # 删除映射(读取，删除，保存)
-            session_name = get_session_name_by_id(session_id)
-            update_session_map("delete", session_name)
-            return {"status": "success"}
-        else:
-            raise HTTPException(status_code=404, detail="Session not found")
+            logger.debug("会话文件删除成功，session_id: %s, file_path: %s", session_id, session_file)
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -491,27 +415,83 @@ async def delete_session(session_id: str):
 async def rename_session(session_id: str, name: str = Body(..., embed=True)):
     """重命名指定会话"""
     try:
-        # 通过更改映射文件中的映射修改会话名称(读取，修改，保存)
-        update_session_map("rename", name, session_id)
+        # 需要传入用户id吗？不需要，因为thread_id是主键，不会重复
+        async with app.state.pg_pool.connection(timeout=30.0) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT thread_id FROM sessions WHERE thread_id = %s",
+                    (session_id,)
+                )
+                result = await cur.fetchone()
+                if not result or not result[0]:
+                    logger.error("会话ID %s 不存在，无法重命名", session_id)
+                    raise HTTPException(status_code=404, detail="Session not found in database")
+
+                await cur.execute(
+                    "UPDATE sessions SET title = %s WHERE thread_id = %s",
+                    (name, session_id)
+                )
+                logger.debug("会话标题更新成功，session_id: %s, new_name: %s", session_id, name)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/sessions")
-async def create_session(session_id: str = Body(..., embed=True), session_name: str = Body(..., embed=True)):
+async def create_session(
+        session_id: str = Body(..., embed=True),
+        user_id: int = Body(..., embed=True),
+        session_name: str = Body(..., embed=True)
+):
     """创建新会话"""
     try:
-        # 创建会话文件
-        session_file = get_session_file_by_id(session_id)
-        os.makedirs(os.path.dirname(session_file), exist_ok=True)
-        with open(session_file, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
+        async with app.state.pg_pool.connection(timeout=30.0) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT user_id FROM users WHERE user_id = %s",
+                    (user_id,)
+                )
+                result = await cur.fetchone()
+                if not result or not result[0]:
+                    logger.error("用户ID %s 不存在，无法创建会话", user_id)
+                    raise HTTPException(status_code=404, detail="没有发现该用户")
 
-        # 添加到映射
-        update_session_map("add", session_name, session_id)
+                await cur.execute(
+                    "INSERT INTO sessions (thread_id, user_id, title) VALUES (%s, %s, %s)",
+                    (session_id, user_id, session_name)
+                )
+                logger.debug("会话创建成功，session_id: %s, session_name: %s, user_id: %s", session_id, session_name, user_id)
 
         return {"status": "success", "session_id": session_id, "session_name": session_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions")
+async def get_sessions(user_id: int = Query(...)):
+    """获取用户的会话列表"""
+    try:
+        sessions = []
+        
+        # 从数据库中获取会话列表
+        async with app.state.pg_pool.connection(timeout=30.0) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT thread_id, title FROM sessions WHERE user_id = %s ORDER BY created_at DESC",
+                    (user_id,)
+                )
+                rows = await cur.fetchall()
+                if not rows:
+                    logger.info("用户ID %s 没有会话记录", user_id)
+
+                for row in rows:
+                    sessions.append({
+                        "session_id": row[0],
+                        "session_name": row[1]
+                    })
+
+        logger.info("获取会话列表成功，user_id: %s, 会话数量: %s", user_id, len(sessions))
+        return {"sessions": sessions}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -519,14 +499,22 @@ async def create_session(session_id: str = Body(..., embed=True), session_name: 
 if __name__ == "__main__":
     import uvicorn
     from asyncio.windows_events import WindowsSelectorEventLoopPolicy
+    import traceback
 
-    # 确保 uvicorn 使用兼容的事件循环
-    asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+    try:
+        print("Starting server...")
+        # 确保 uvicorn 使用兼容的事件循环
+        asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
 
-    # 在当前策略下显式创建事件循环，避免ProactorEventLoop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+        # 在当前策略下显式创建事件循环，避免ProactorEventLoop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    config = uvicorn.Config(app, host="127.0.0.1", port=8002, loop="asyncio")
-    server = uvicorn.Server(config)
-    loop.run_until_complete(server.serve())
+        print("Server configuration created")
+        config = uvicorn.Config(app, host="127.0.0.1", port=8002, loop="asyncio", log_level="info")
+        server = uvicorn.Server(config)
+        print("Starting server with uvicorn...")
+        loop.run_until_complete(server.serve())
+    except Exception as e:
+        print(f"Error starting server: {e}")
+        traceback.print_exc()

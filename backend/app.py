@@ -12,9 +12,11 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, ToolMessage, AIMessageChunk
 from langchain_openai import ChatOpenAI
 
-from tools.core_tools import get_core_tools
-from tools.memory_manager import MemoryManager
-from tools.skills_manager import SkillsManager
+from backend.tools.core_tools import get_core_tools
+from backend.tools.memory_manager import MemoryManager
+from backend.tools.skills_manager import SkillsManager
+from backend.api.user import user_router
+from backend.api.login import login_router
 
 # 初始化核心组件
 skills_manager = SkillsManager()
@@ -54,6 +56,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 注册路由
+app.include_router(login_router)
+app.include_router(user_router)
 
 
 # 会话管理

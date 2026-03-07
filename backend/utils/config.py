@@ -25,7 +25,7 @@ class Config:
     EXPIRE_TIME = 3600
     TOKEN_HEADER_KEY = "X-Token"
     # 无需鉴权的接口路径（白名单）
-    WHITE_LIST = ["/api/login", "/docs", "/openapi.json", "/redoc"]  # 包含接口文档相关路径
+    WHITE_LIST = ["/api/login", "/api/user/register", "/docs", "/openapi.json", "/redoc"]  # 包含接口文档相关路径
 
 
 

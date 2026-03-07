@@ -1,28 +1,15 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Menu, FileText, Book, Code, Plus, Trash2 } from 'lucide-react';
+import { Send, Menu, FileText, Book, Code, Plus, Trash2, Settings } from 'lucide-react';
 import Editor from '@monaco-editor/react';
+import UserSettings from './UserSettings';
 
 // 类型定义
-interface ToolCall {
-  id: string;
-  name: string;
-  args: Record<string, any>;
-}
-
-interface ToolResult {
-  tool_call_id: string;
-  name: string;
-  result: any;
-}
-
 interface Message {
   id: string;
   role: 'user' | 'assistant' | 'thought' | 'tool' | 'error';
   content: string;
-  tool_calls?: ToolCall[];
-  tool_result?: ToolResult;
 }
 
 interface Session {
@@ -37,15 +24,15 @@ interface Skill {
 }
 
 interface AppContentProps {
-  currentUser: { id: string };
+  currentUser: { id: string; username?: string };
   onLogout: () => void;
 }
 
-export default function AppContent({ currentUser, onLogout }: AppContentProps) {
+export default function AppContent({ currentUser: initialCurrentUser, onLogout }: AppContentProps) {
   // 状态管理
   const [activeTab, setActiveTab] = useState<'chat' | 'memory' | 'skills'>('memory');
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [activeSession, setActiveSession] = useState<string>('main_session');
+  const [activeSession, setActiveSession] = useState<string>(''); // 初始为空，不默认选择任何会话
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputMessage, setInputMessage] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
@@ -56,32 +43,46 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
   const [currentFile, setCurrentFile] = useState<{ path: string; content: string }>({ path: '', content: '' });
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingSessionName, setEditingSessionName] = useState('');
+  const [showUserSettings, setShowUserSettings] = useState(false);
+  const [currentUser, setCurrentUser] = useState<{ id: string; username?: string }>(initialCurrentUser);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // 监听用户名更新事件
+  useEffect(() => {
+    const handleUsernameUpdated = (event: CustomEvent) => {
+      const { username } = event.detail;
+      // 更新currentUser中的username
+      setCurrentUser(prev => prev ? { ...prev, username } : prev);
+    };
+
+    // 添加事件监听器
+    window.addEventListener('usernameUpdated', handleUsernameUpdated as EventListener);
+
+    // 清理事件监听器
+    return () => {
+      window.removeEventListener('usernameUpdated', handleUsernameUpdated as EventListener);
+    };
+  }, []);
 
   // 获取token的辅助函数
   const getAuthHeaders = () => {
     const token = localStorage.getItem('token');
-    const user = localStorage.getItem('user');
-    const user_id = user ? JSON.parse(user).id : null;
-    console.log('Token:', token, 'User ID:', user_id);
+    const user_id = localStorage.getItem('user_id');
     const headers: Record<string, string> = {};
     if (token) {
       headers['X-Token'] = token;
     }
     if (user_id) {
-      headers['X-User-Id'] = user_id.toString();
+      headers['X-User-Id'] = user_id;
     }
     return headers;
   };
 
   // 处理401错误的函数
   const handle401Error = () => {
-    console.log('401 Unauthorized - token is invalid or expired');
-    // 清除本地存储的token和用户信息
     localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    // 重新登录
+    localStorage.removeItem('user_id');
     window.location.reload();
   };
 
@@ -90,11 +91,10 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
     const loadSessions = async () => {
       try {
         const token = localStorage.getItem('token');
-        if (!token) {
-          console.log('No token found, skipping session load');
-          return;
-        }
-        const response = await fetch('/api/sessions', {
+        const user_id = localStorage.getItem('user_id');
+        if (!token || !user_id) return;
+        const response = await fetch(`/api/sessions?user_id=${user_id}`, {
+          method: 'GET',
           headers: getAuthHeaders()
         });
         if (response.ok) {
@@ -104,14 +104,8 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
             name: session.session_name
           }));
           setSessions(sessionList);
-          if (sessionList.length > 0) {
-            setActiveSession(sessionList[0].id);
-          }
-        } else {
-          console.log('Session load failed:', response.status);
-          if (response.status === 401) {
-            handle401Error();
-          }
+        } else if (response.status === 401) {
+          handle401Error();
         }
       } catch (error) {
         console.error('加载会话失败:', error);
@@ -126,22 +120,17 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
     const loadHistory = async () => {
       try {
         const token = localStorage.getItem('token');
-        if (!token) {
-          console.log('No token found, skipping history load');
-          return;
-        }
+        const user_id = localStorage.getItem('user_id');
+        if (!token || !user_id) return;
         const response = await fetch(`/api/history/${activeSession}`, {
           headers: getAuthHeaders()
         });
         if (response.ok) {
           const data = await response.json();
           const formattedMessages: Message[] = [];
-
           for (let i = 0; i < data.messages.length; i++) {
             const msg = data.messages[i];
-            // 确保 content 是字符串
             const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-
             if (msg.role === 'user') {
               formattedMessages.push({
                 id: `hist_${i}_user`,
@@ -152,28 +141,19 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
               formattedMessages.push({
                 id: `hist_${i}_assistant`,
                 role: 'assistant',
-                content: contentStr,
-                tool_calls: msg.tool_calls
+                content: contentStr
               });
             } else if (msg.role === 'tool') {
               formattedMessages.push({
                 id: `hist_${i}_tool`,
                 role: 'tool',
-                content: contentStr,
-                tool_result: {
-                  tool_call_id: msg.tool_call_id,
-                  name: msg.name,
-                  result: msg.content // 保留原始结果（可能用于后续）
-                }
+                content: contentStr
               });
             }
           }
           setMessages(formattedMessages);
-        } else {
-          console.log('History load failed:', response.status);
-          if (response.status === 401) {
-            handle401Error();
-          }
+        } else if (response.status === 401) {
+          handle401Error();
         }
       } catch (error) {
         console.error('加载会话历史失败:', error);
@@ -187,29 +167,24 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
     const loadSkills = async () => {
       try {
         const token = localStorage.getItem('token');
-        if (!token) {
-          console.log('No token found, skipping skills load');
-          return;
-        }
+        const user_id = localStorage.getItem('user_id');
+        if (!token || !user_id) return;
         const response = await fetch('/api/skills/list', {
           headers: getAuthHeaders()
         });
         if (response.ok) {
           const data = await response.json();
           setSkills(data.skills);
+        } else if (response.status === 401) {
+          handle401Error();
         } else {
-          console.log('Skills load failed:', response.status);
-          if (response.status === 401) {
-            handle401Error();
-          } else {
-            setSkills([
-              {
-                name: 'get_weather',
-                description: '获取指定城市的实时天气信息',
-                location: 'skills/get_weather/SKILL.md'
-              }
-            ]);
-          }
+          setSkills([
+            {
+              name: 'get_weather',
+              description: '获取指定城市的实时天气信息',
+              location: 'skills/get_weather/SKILL.md'
+            }
+          ]);
         }
       } catch (error) {
         console.error('加载技能失败:', error);
@@ -233,7 +208,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
   // 发送消息
   const handleSendMessage = useCallback(async () => {
     if (!inputMessage.trim() || !currentUser) return;
-
     const userMsg: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -242,14 +216,12 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
     setMessages(prev => [...prev, userMsg]);
     setInputMessage('');
     setIsStreaming(true);
-
     const thoughtMsg: Message = {
       id: Date.now().toString() + '_thought',
       role: 'thought',
       content: '正在分析用户请求...'
     };
     setMessages(prev => [...prev, thoughtMsg]);
-
     try {
         const response = await fetch('/api/chat', {
           method: 'POST',
@@ -264,48 +236,37 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
             stream: true
           })
         });
-
       if (response.status === 401) {
         handle401Error();
         return;
       }
-
       if (response.ok && response.body) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-
         let currentAssistantMsg: Message | null = null;
-        const pendingToolCalls = new Map<string, ToolCall>();
         let thoughtRemoved = false;
-
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-
           const chunk = decoder.decode(value, { stream: true });
           const lines = chunk.split('\n');
-
           for (const line of lines) {
             if (line.startsWith('data: ')) {
               const data = line.substring(6);
               if (data === '[DONE]') continue;
-
               try {
                 const event = JSON.parse(data);
-
                 if (!thoughtRemoved && event.type !== 'thought') {
                   setMessages(prev => prev.filter(m => m.id !== thoughtMsg.id));
                   thoughtRemoved = true;
                 }
-
                 switch (event.type) {
                   case 'message_chunk':
                     if (!currentAssistantMsg) {
                       currentAssistantMsg = {
                         id: `assistant_${Date.now()}`,
                         role: 'assistant',
-                        content: '',
-                        tool_calls: []
+                        content: ''
                       };
                       setMessages(prev => [...prev, currentAssistantMsg!]);
                     }
@@ -314,41 +275,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
                       prev.map(m => m.id === currentAssistantMsg!.id ? currentAssistantMsg! : m)
                     );
                     break;
-
-                  case 'tool_call':
-                    if (currentAssistantMsg) {
-                      const toolCalls = event.content as ToolCall[];
-                      currentAssistantMsg.tool_calls = [
-                        ...(currentAssistantMsg.tool_calls || []),
-                        ...toolCalls
-                      ];
-                      toolCalls.forEach(tc => pendingToolCalls.set(tc.id, tc));
-                      setMessages(prev =>
-                        prev.map(m => m.id === currentAssistantMsg!.id ? currentAssistantMsg! : m)
-                      );
-                    }
-                    break;
-
-                  case 'tool_result':
-                    const result = event.content;
-                    // 确保结果是字符串形式显示
-                    const resultContent = typeof result.result === 'string'
-                      ? result.result
-                      : JSON.stringify(result.result, null, 2);
-                    const toolMsg: Message = {
-                      id: `tool_${Date.now()}_${result.tool_call_id}`,
-                      role: 'tool',
-                      content: resultContent,
-                      tool_result: {
-                        tool_call_id: result.tool_call_id,
-                        name: result.name,
-                        result: result.result
-                      }
-                    };
-                    setMessages(prev => [...prev, toolMsg]);
-                    pendingToolCalls.delete(result.tool_call_id);
-                    break;
-
                   case 'error':
                     setMessages(prev => [...prev, {
                       id: `error_${Date.now()}`,
@@ -363,9 +289,9 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
             }
           }
         }
-
-        // 流结束后重新加载历史，确保一致性
-        const historyResponse = await fetch(`/api/history/${activeSession}`);
+        const historyResponse = await fetch(`/api/history/${activeSession}`, {
+          headers: getAuthHeaders()
+        });
         if (historyResponse.ok) {
           const data = await historyResponse.json();
           const formattedMessages: Message[] = [];
@@ -382,19 +308,13 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
               formattedMessages.push({
                 id: `hist_${i}_assistant`,
                 role: 'assistant',
-                content: contentStr,
-                tool_calls: msg.tool_calls
+                content: contentStr
               });
             } else if (msg.role === 'tool') {
               formattedMessages.push({
                 id: `hist_${i}_tool`,
                 role: 'tool',
-                content: contentStr,
-                tool_result: {
-                  tool_call_id: msg.tool_call_id,
-                  name: msg.name,
-                  result: msg.content
-                }
+                content: contentStr
               });
             }
           }
@@ -471,11 +391,14 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
   }, [currentFile]);
 
   const createNewSession = useCallback(async () => {
-    const newSessionId = `session_${Date.now()}`;
-    const newSessionName = newSessionId;
-    
+    const user_id = localStorage.getItem('user_id');
+    if (!user_id) {
+      alert('用户未登录，无法创建会话');
+      return;
+    }
     try {
-      // 向后端发送请求，创建会话并添加到映射
+      const newSessionId = `session_${Date.now()}`;
+      const newSessionName = `会话 ${new Date().toLocaleString()}`;
       const response = await fetch('/api/sessions', {
         method: 'POST',
         headers: {
@@ -484,17 +407,15 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
         },
         body: JSON.stringify({
           session_id: newSessionId,
+          user_id: user_id,
           session_name: newSessionName
         })
       });
-      
       if (response.status === 401) {
         handle401Error();
         return;
       }
-      
       if (response.ok) {
-        // 更新会话列表
         setSessions(prev => [...prev, { id: newSessionId, name: newSessionName }]);
         setActiveSession(newSessionId);
         setMessages([]);
@@ -515,17 +436,14 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
           headers: {
             'Content-Type': 'application/json',
             ...getAuthHeaders()
-          },
+          }
         });
-
         if (response.status === 401) {
           handle401Error();
           return;
         }
-
         if (response.ok) {
           setSessions(prev => prev.filter(session => session.id !== sessionId));
-          
           if (activeSession === sessionId) {
             const remainingSessions = sessions.filter(s => s.id !== sessionId);
             if (remainingSessions.length > 0) {
@@ -554,7 +472,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
 
   const saveSessionName = useCallback(async () => {
     if (!editingSessionId || !editingSessionName.trim()) return;
-    
     try {
       const response = await fetch(`/api/sessions/${editingSessionId}/rename`, {
         method: 'POST',
@@ -564,20 +481,16 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
         },
         body: JSON.stringify({ name: editingSessionName.trim() })
       });
-      
       if (response.status === 401) {
         handle401Error();
         return;
       }
-      
       if (response.ok) {
-        // 更新会话列表
         setSessions(prev => prev.map(session => 
           session.id === editingSessionId 
             ? { ...session, name: editingSessionName.trim() } 
             : session
         ));
-        
         setEditingSessionId(null);
         setEditingSessionName('');
       } else {
@@ -599,14 +512,12 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
     const handleClickOutside = (event: MouseEvent) => {
       if (editingSessionId) {
         const target = event.target as HTMLElement;
-        // 检查点击的元素是否在编辑区域内
         const editingElement = document.querySelector(`[data-session-id="${editingSessionId}"]`);
         if (editingElement && !editingElement.contains(target)) {
           cancelEditSession();
         }
       }
     };
-
     document.addEventListener('click', handleClickOutside);
     return () => {
       document.removeEventListener('click', handleClickOutside);
@@ -641,7 +552,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
               New Chat
             </button>
           </div>
-
           <div className="flex-1 overflow-auto p-5">
             <h2 className="text-sm font-medium text-gray-500 mb-4 uppercase tracking-wider">Recent</h2>
             <div className="space-y-3">
@@ -739,7 +649,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
           </button>
         </div>
       )}
-
       {/* 中间聊天区域 */}
       <div className="main-content flex flex-col flex-1 bg-gray-50">
         <div className="topbar sticky top-0 z-10 p-5 bg-white border-b border-gray-200">
@@ -750,8 +659,15 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
               </div>
               <h2 className="text-lg font-medium">{activeSession}</h2>
             </div>
-            <div className="flex items-center gap-6">
-              <span className="text-sm text-gray-600">用户: {currentUser?.id}</span>
+            <div className="flex items-center gap-4">
+              <span className="text-sm text-gray-600">用户: {currentUser?.username || currentUser?.id}</span>
+              <button
+                onClick={() => setShowUserSettings(true)}
+                className="p-2 rounded-full hover:bg-gray-100 transition-colors"
+                title="用户设置"
+              >
+                <Settings className="w-5 h-5" />
+              </button>
               <button
                 onClick={onLogout}
                 className="text-sm text-blue-600 hover:underline font-medium"
@@ -764,7 +680,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
             </div>
           </div>
         </div>
-
         <div className="flex-1 overflow-auto p-8">
           {messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center">
@@ -803,43 +718,13 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
                           message.role === 'tool' ? 'Tool' :
                             message.role === 'error' ? 'Error' : ''}
                   </div>
-
-                  {message.role === 'assistant' && (
-                    <>
-                      <div className="whitespace-pre-wrap text-sm">{message.content}</div>
-                      {message.tool_calls && message.tool_calls.length > 0 && (
-                        <div className="mt-3 space-y-2 border-t pt-2">
-                          {message.tool_calls.map(tc => (
-                            <div key={tc.id} className="bg-blue-100 p-2 rounded text-xs">
-                              🔧 调用工具 <span className="font-mono">{tc.name}</span> 参数: {JSON.stringify(tc.args)}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </>
-                  )}
-
-                  {message.role === 'tool' && (
-                    <div className="text-sm">
-                      <div className="text-xs text-gray-500 mb-1">
-                        工具: {message.tool_result?.name} (调用ID: {message.tool_result?.tool_call_id})
-                      </div>
-                      <pre className="whitespace-pre-wrap bg-green-100 p-2 rounded">
-                        {message.content}
-                      </pre>
-                    </div>
-                  )}
-
-                  {!['assistant', 'tool'].includes(message.role) && (
-                    <div className="whitespace-pre-wrap text-sm">{message.content}</div>
-                  )}
+                  <div className="whitespace-pre-wrap text-sm">{message.content}</div>
                 </div>
               ))}
             </div>
           )}
           <div ref={messagesEndRef} />
         </div>
-
         <div className="input-area p-5 bg-white border-t border-gray-200">
           <div className="flex gap-3">
             <textarea
@@ -865,7 +750,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
           </div>
         </div>
       </div>
-
       {/* 右侧编辑器/检查器 */}
       {!inspectorCollapsed ? (
         <div className="inspector flex flex-col w-80 bg-white border-l border-gray-200">
@@ -873,16 +757,14 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
             <div className="flex items-center gap-4">
               <button
                 onClick={() => setActiveTab('memory')}
-                className={`flex items-center gap-2 px-2 py-1 rounded-md ${activeTab === 'memory' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
-                  }`}
+                className={`flex items-center gap-2 px-2 py-1 rounded-md ${activeTab === 'memory' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'}`}
               >
                 <Book className="w-5 h-5" />
                 Memory
               </button>
               <button
                 onClick={() => setActiveTab('skills')}
-                className={`flex items-center gap-2 px-2 py-1 rounded-md ${activeTab === 'skills' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'
-                  }`}
+                className={`flex items-center gap-2 px-2 py-1 rounded-md ${activeTab === 'skills' ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'}`}
               >
                 <Code className="w-5 h-5" />
                 Skills
@@ -895,7 +777,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
               <Menu className="w-5 h-5" />
             </button>
           </div>
-
           {activeTab === 'memory' && (
             <div className="p-5 flex-1 overflow-auto">
               <h3 className="text-sm font-medium text-gray-500 mb-4 uppercase tracking-wider">Workspace</h3>
@@ -920,7 +801,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
               </div>
             </div>
           )}
-
           {activeTab === 'skills' && (
             <div className="p-5 flex-1 overflow-auto">
               <h3 className="text-sm font-medium text-gray-500 mb-4 uppercase tracking-wider">Skills</h3>
@@ -949,7 +829,6 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
           </button>
         </div>
       )}
-
       {/* 文件编辑模态框 */}
       {showFileModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -990,6 +869,14 @@ export default function AppContent({ currentUser, onLogout }: AppContentProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 用户设置模态框 */}
+      {showUserSettings && (
+        <UserSettings 
+          user_id={currentUser.id} 
+          onClose={() => setShowUserSettings(false)} 
+        />
       )}
     </div>
   );

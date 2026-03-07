@@ -4,6 +4,7 @@ from langchain_experimental.tools import PythonREPLTool
 from bs4 import BeautifulSoup
 import html2text
 import os
+import requests
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.core.retrievers import BaseRetriever
 from typing import List, Dict, Any
@@ -20,8 +21,19 @@ class EnhancedRequestsGetTool(RequestsGetTool):
         super().__init__(requests_wrapper=requests_wrapper, allow_dangerous_requests=allow_dangerous)
 
     def _run(self, url: str) -> str:
-        # 调用父类方法获取原始HTML
-        html_content = super()._run(url)
+        try:
+            # 尝试调用父类方法获取原始HTML
+            html_content = super()._run(url)
+        except requests.exceptions.SSLError as e:
+            # SSL 错误时，尝试禁用 SSL 验证重试
+            try:
+                response = requests.get(url, verify=False, timeout=30)
+                response.raise_for_status()
+                html_content = response.text
+            except Exception as retry_error:
+                return f"获取URL内容失败（SSL错误）: {str(e)}. 重试也失败: {str(retry_error)}"
+        except requests.exceptions.RequestException as e:
+            return f"获取URL内容失败: {str(e)}"
 
         # 使用BeautifulSoup清洗HTML
         soup = BeautifulSoup(html_content, 'html.parser')  # features: html.parser, lxml, html5lib
