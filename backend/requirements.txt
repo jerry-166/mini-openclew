@@ -11,6 +11,5 @@ langchain_openai
 langgraph
 psycopg_pool
 concurrent_log_handler
-postgres
 langgraph-checkpoint-postgres==3.0.2
 redis
